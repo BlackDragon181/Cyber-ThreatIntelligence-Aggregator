@@ -1,0 +1,3 @@
+# Install required dependencies
+pip install flask requests pandas beautifulsoup4 feedparser openpyxl
+
