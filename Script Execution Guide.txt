@@ -1,0 +1,5 @@
+# Run the application
+python cti_aggregator.py
+
+# Access the web interface
+# Open browser to: http://localhost:5000
