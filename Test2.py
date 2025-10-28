@@ -45,7 +45,7 @@ The tool automatically analyzes vulnerabilities based on:
 ✓ CVSS Score > 8.0
 ✓ Internet Facing detection via Public IP Address
   - Searches: IP, IP_Address, IPv4_Address, asset.display_ipv4_address
-  - Automatically identifies public vs private IP ranges
+  - Automatically identifies public vs private IP ranges (RFC1918)
 ✓ CIA Impact levels (Confidentiality, Integrity, Availability)
 ✓ Remote Code Execution (RCE) capability
 ✓ Privilege requirements
@@ -95,39 +95,100 @@ Score Ranges:
             self.input_file = filename
             self.input_label.config(text=filename.split('/')[-1], foreground="black")
     
-    def is_public_ip(self, ip_str):
-        """Check if an IP address is public (internet-facing)"""
+    # ------------------- IP utilities -------------------
+    def find_ips_in_text(self, text):
+        """
+        Find IPv4 addresses in a text block. Uses a permissive regex then validates via ipaddress,
+        to avoid rejecting valid addresses embedded in other characters.
+        Returns list of valid IP strings (may be empty).
+        """
+        if not text or pd.isna(text):
+            return []
+        # Permissive IPv4 regex (we'll validate later with ipaddress)
+        candidate_ips = re.findall(r'(?:\d{1,3}\.){3}\d{1,3}', str(text))
+        valid_ips = []
+        for cand in candidate_ips:
+            try:
+                ip = ipaddress.ip_address(cand)
+                # Only include IPv4 here (most vulnerability reports use IPv4)
+                if ip.version == 4:
+                    valid_ips.append(str(ip))
+            except Exception:
+                continue
+        return valid_ips
+
+    def classify_ip(self, ip_str):
+        """
+        Classify an IP into categories using standards (RFC1918 etc).
+        Returns: one of
+          - "Public"
+          - "Private(RFC1918)"
+          - "Loopback"
+          - "LinkLocal"
+          - "Multicast"
+          - "Reserved"
+          - "Invalid"
+        """
         try:
             ip = ipaddress.ip_address(ip_str.strip())
-            
-            # Check if IP is global (public)
-            if ip.is_global:
-                return True
-            
-            # Additional check for public ranges
-            if not (ip.is_private or ip.is_loopback or ip.is_link_local or 
-                   ip.is_multicast or ip.is_reserved):
-                return True
-                
-        except (ValueError, AttributeError):
-            pass
+        except Exception:
+            return "Invalid"
         
-        return False
-    
+        # Loopback
+        if ip.is_loopback:
+            return "Loopback"
+        # Link-local (169.254.0.0/16)
+        if ip.is_link_local:
+            return "LinkLocal"
+        # Multicast
+        if ip.is_multicast:
+            return "Multicast"
+        # Private (RFC1918: 10/8, 172.16/12, 192.168/16)
+        if ip.is_private:
+            # ip.is_private in the ipaddress library covers RFC1918 ranges for IPv4
+            return "Private(RFC1918)"
+        # Reserved (includes unspecified, documentation, benchmark ranges, etc.)
+        if ip.is_reserved:
+            return "Reserved"
+        # Global/public
+        if ip.is_global:
+            return "Public"
+        # If none matched, treat as Reserved/Non-public
+        return "Reserved"
+
+    def is_public_ip(self, ip_str):
+        """Return True if IP is classified as Public by classify_ip"""
+        cls = self.classify_ip(ip_str)
+        return cls == "Public"
+    # ----------------------------------------------------
+
     def extract_ip_address(self, row):
-        """Extract IP address from various column formats"""
-        ip_columns = ['ip', 'ip_address', 'ipv4', 'ipv4_address', 'asset.display_ipv4_address', 
-                     'display_ipv4_address', 'host', 'host_ip', 'target', 'target_ip']
+        """
+        Extract IP address from various column formats.
+        Tries:
+         - explicit IP-like columns first (by name)
+         - then scans all cell values for embedded IPv4 addresses
+        Returns the first found IP string or None.
+        """
+        ip_col_patterns = ['ip', 'ip_address', 'ipv4', 'ipv4_address', 
+                           'asset.display_ipv4_address', 'display_ipv4_address',
+                           'host_ip', 'host', 'target_ip', 'target']
         
+        # 1) Prefer columns with IP-like names
         for col in row.index:
             col_lower = col.lower()
-            # Check if column name contains any IP-related keywords
-            if any(ip_col in col_lower for ip_col in ip_columns):
-                ip_value = str(row[col]).strip()
-                # Basic IP validation pattern
-                ip_pattern = r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$'
-                if re.match(ip_pattern, ip_value):
-                    return ip_value
+            if any(pattern in col_lower for pattern in ip_col_patterns):
+                cell = row[col]
+                ips = self.find_ips_in_text(cell)
+                if ips:
+                    return ips[0]
+        
+        # 2) Scan all cells for any embedded IPs
+        for col in row.index:
+            cell = row[col]
+            ips = self.find_ips_in_text(cell)
+            if ips:
+                return ips[0]
         
         return None
     
@@ -140,19 +201,28 @@ Score Ranges:
                 cvss_str = str(row[col])
                 match = re.search(r'\d+\.?\d*', cvss_str)
                 if match:
-                    return float(match.group())
+                    try:
+                        return float(match.group())
+                    except:
+                        pass
         return 0.0
     
     def check_internet_facing(self, row):
-        """Determine if vulnerability is internet facing based on IP address"""
+        """Determine if vulnerability is internet facing based on IP address and descriptors"""
         # First, try to extract and check IP address
         ip_address = self.extract_ip_address(row)
         
         if ip_address:
-            if self.is_public_ip(ip_address):
+            cls = self.classify_ip(ip_address)
+            # If explicitly public, mark as internet-facing
+            if cls == "Public":
                 return True
+            # If private / loopback / linklocal / reserved -> not internet-facing
+            if cls in ("Private(RFC1918)", "Loopback", "LinkLocal", "Multicast", "Reserved", "Invalid"):
+                # consider non-internet-facing unless other indicators exist
+                return False
         
-        # Additional checks for exposure keywords
+        # Additional checks for exposure keywords (fallback)
         exposure_keywords = ['internet', 'external', 'public', 'exposed', 'wan', 'dmz']
         network_keywords = ['network', 'exposure', 'accessibility', 'access', 'zone']
         
@@ -162,7 +232,7 @@ Score Ranges:
             if keyword in row_str:
                 return True
         
-        # Check if any network-related field contains "high" or "external"
+        # Check if any network-related field contains "external" or "public"
         for col in row.index:
             if any(net_key in col.lower() for net_key in network_keywords):
                 val_str = str(row[col]).lower()
@@ -332,12 +402,18 @@ Score Ranges:
         # 2. Internet Facing/High Exposure (determined by IP address)
         ip_address = self.extract_ip_address(row)
         if self.check_internet_facing(row):
-            if ip_address and self.is_public_ip(ip_address):
-                score += 10
-                priority_details.append(f"Internet Facing - Public IP: {ip_address} [10]")
+            if ip_address:
+                cls = self.classify_ip(ip_address)
+                if cls == "Public":
+                    score += 10
+                    priority_details.append(f"Internet Facing - Public IP: {ip_address} [10]")
+                else:
+                    # Exposed but IP is private/other -> still treat as high exposure
+                    score += 10
+                    priority_details.append(f"Internet Facing indicator present (IP class: {cls}) [10]")
             else:
                 score += 10
-                priority_details.append("Internet Facing/High Exposure [10]")
+                priority_details.append("Internet Facing/High Exposure (keyword-based) [10]")
         
         # 3. Availability Impact - High
         if self.check_impact_level(row, 'availability'):
@@ -531,7 +607,7 @@ Score Ranges:
                         for cell in column:
                             try:
                                 if len(str(cell.value)) > max_length:
-                                    max_length = len(cell.value)
+                                    max_length = len(str(cell.value))
                             except:
                                 pass
                         adjusted_width = min(max_length + 2, 50)
